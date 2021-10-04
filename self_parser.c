@@ -47,6 +47,44 @@ static const char *get_section_name_from_type(int sh_type)
         return "SHT_UNKNOWN";
 }
 
+static const char *get_ptype_name(int ptype)
+{
+    if (ptype == PT_NULL)
+        return "PT_NULL";
+    else if (ptype == PT_LOAD)
+        return "PT_LOAD";
+    else if (ptype == PT_DYNAMIC)
+        return "PT_DYNAMIC";
+    else if (ptype == PT_INTERP)
+        return "PT_INTERP";
+    else if (ptype == PT_NOTE)
+        return "PT_NOTE";
+    else if (ptype == PT_SHLIB)
+        return "PT_SHLIB";
+    else if (ptype == PT_PHDR)
+        return "PT_PHDR";
+    else if (ptype == PT_GNU_STACK)
+        return "PT_GNU_STACK";
+    else
+        return "UNKNOWN";
+}
+
+static const char *get_pflags_name(int pflags, char *pflag_name)
+{
+    char *original_pflags = pflag_name;
+    if (pflags & PF_X)
+        *(pflag_name++) = 'X';
+
+    if (pflags & PF_W)
+        *(pflag_name++) = 'W';
+
+    if (pflags & PF_R)
+        *(pflag_name++) = 'R';
+
+    *(pflag_name++) = '\0';
+    return original_pflags;
+}
+
 static unsigned char *get_section_data(Elf32_Shdr *sh, FILE *f_elf)
 {
     int ret;
@@ -78,9 +116,11 @@ static int parse_elf(char *elf_path)
     int ret = 0, str_symtab_index = -1, symtab_index = -1;
     FILE *f_elf;
     size_t nread, section_headers_len, symbol_num;
+
     Elf32_Ehdr elf_header;
     Elf32_Shdr *section_header;
     Elf32_Shdr *sh_strtab, *sh_strsymtab, *sh_symtab;
+    Elf32_Phdr *phdr;
 
     f_elf = fopen(elf_path, "r");
     if (f_elf == NULL) {
@@ -132,6 +172,54 @@ static int parse_elf(char *elf_path)
         ret = -EINVAL;
         goto errout_with_file;
     }
+
+    /* Look for program headers */
+
+    if (elf_header.e_phoff == 0 || elf_header.e_phnum == 0) {
+        printf("No program header\n");
+        ret = -EINVAL;
+        goto errout_with_file;
+    }
+
+    /* Parse program header */
+
+    ret = fseek(f_elf, (long int)elf_header.e_phoff, SEEK_SET);
+    if (ret != 0) {
+        printf("Cannot seek to program header [%d]\n", elf_header.e_phoff);
+        goto errout_with_shdr;
+    }
+
+    phdr = calloc(elf_header.e_phnum, sizeof(Elf32_Phdr));
+    if (phdr == NULL) {
+        ret = -ENOMEM;
+        goto errout_with_file;
+    }
+
+    nread = fread(phdr, sizeof(Elf32_Phdr), elf_header.e_phnum, f_elf);
+    if (nread != elf_header.e_phnum) {
+        printf("Read program header error from file: %s\n", elf_path);
+        ret = -EINVAL;
+        goto errout_with_phdr;
+    }
+
+    printf("Found %d program headers at offset 0x%x\n\n",
+           elf_header.e_phnum,
+           elf_header.e_phoff);
+
+    for (int i = 0; i < elf_header.e_phnum; i++) {
+        char p_flags_name[10] = {0};
+        printf("Segment %2d type [%13s] p_offset %4x | p_vaddr %4x | p_filez %4u "
+               "| p_memsz %4u | p_flags %4s | p_align %4u\n",
+               i,
+               get_ptype_name(phdr[i].p_type),
+               phdr[i].p_offset,
+               phdr[i].p_vaddr,
+               phdr[i].p_filesz,
+               phdr[i].p_memsz,
+               get_pflags_name(phdr[i].p_flags, &p_flags_name[0]),
+               phdr[i].p_align);
+    }
+    printf("\n\n");
 
     /* Allocate space for the section header table and read it */
 
@@ -260,6 +348,8 @@ errout_with_strtab:
     free(sh_strtab_data);
 errout_with_shdr:
     free(section_header);
+errout_with_phdr:
+    free(phdr);
 errout_with_file:
     fclose(f_elf);
     return ret;
