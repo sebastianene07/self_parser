@@ -1,3 +1,4 @@
+#include <elf.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -15,6 +16,8 @@
 #define MAX_NUM_CMD_ARGS        (10)
 #define MAX_CMD_ARG_SIZE        (32)
 
+#define ELF_SIGNATURE   {0x7F, 0x45, 0x4C, 0x46}
+
 #define ARRAY_LEN(x) (sizeof(x)/sizeof(x[0]))
 
 static volatile int g_run_forever = 1;
@@ -27,6 +30,12 @@ typedef struct cmd_action_s
     const char *cmd_name;   /* The command name */
     const char *cmd_help;   /* The help printed on command failure */
 } cmd_action_t;
+
+typedef union
+{
+    Elf64_Ehdr elf64_hdr;
+    Elf32_Ehdr elf32_hdr;
+} elf_hdr_t;
 
 typedef struct sinject_ctxt_s
 {
@@ -41,8 +50,8 @@ typedef struct sinject_ctxt_s
 static int cb_action_help(int argc, char **argv);
 static int cb_action_quit(int argc, char **argv);
 static int cb_action_select_target_elf(int argc, char **argv);
-static int cb_action_select_inject_payload(int argc, char **argv);
-static int cb_action_patch_target(int argc, char **argv);
+static int cb_action_select_payload(int argc, char **argv);
+static int cb_action_add_segment(int argc, char **argv);
 static int cb_action_write_patch_target(int argc, char **argv);
 
 static sinject_ctxt_t g_sinject_context;
@@ -70,14 +79,14 @@ static cmd_action_t g_cmd_actions[] =
         .cmd_help   = "Select the ELF target that you want to modify <elf_path>",
     },
     {
-        .action     = cb_action_select_inject_payload,
+        .action     = cb_action_select_payload,
         .cmd_name   = "select_payload",
         .cmd_help   = "Select the payload that you want to inject <payload_path>",
     },
     {
-        .action     = cb_action_patch_target,
-        .cmd_name   = "patch_target",
-        .cmd_help   = "Patch the target by adding a new section at the end "
+        .action     = cb_action_add_segment,
+        .cmd_name   = "add_segment",
+        .cmd_help   = "Add a new segment"
                       "of the elf, and modify the NOTE segement to be LOAD "
                       "with XRW permissions"
     },
@@ -88,6 +97,8 @@ static cmd_action_t g_cmd_actions[] =
                       "and close the selected target"
     },
 };
+
+const unsigned char elf_signature[] = ELF_SIGNATURE;
 
 static void do_print_welcome(void)
 {
@@ -119,6 +130,28 @@ static void do_terminate_handler(int not_used)
     g_run_forever = 0;
 }
 
+static const char *get_ptype_name(int ptype)
+{
+    if (ptype == PT_NULL)
+        return "PT_NULL";
+    else if (ptype == PT_LOAD)
+        return "PT_LOAD";
+    else if (ptype == PT_DYNAMIC)
+        return "PT_DYNAMIC";
+    else if (ptype == PT_INTERP)
+        return "PT_INTERP";
+    else if (ptype == PT_NOTE)
+        return "PT_NOTE";
+    else if (ptype == PT_SHLIB)
+        return "PT_SHLIB";
+    else if (ptype == PT_PHDR)
+        return "PT_PHDR";
+    else if (ptype == PT_GNU_STACK)
+        return "PT_GNU_STACK";
+    else
+        return "UNKNOWN";
+}
+
 static int cb_action_help(int argc, char **argv)
 {
     int i;
@@ -138,24 +171,25 @@ static int cb_action_quit(int argc, char **argv)
     return 0;
 }
 
-static int cb_action_select_target_elf(int argc, char **argv)
+static int open_and_map_file(const char *file_name, int *fd, size_t *file_size,
+                             void **mapped_mem)
 {
     struct stat sb;
 
-    g_sinject_context.target_fd = open(argv[1], O_RDWR, 0);
-    if (g_sinject_context.target_fd < 0) {
-        printf("error open %s\n", argv[1]);
+    *fd = open(file_name, O_RDWR, 0);
+    if (*fd < 0) {
+        printf("error open %s\n", file_name);
         return -1;
     }
 
     /* Get the file size and map the entire file in memory*/
 
-    fstat(g_sinject_context.target_fd, &sb);
-    g_sinject_context.target_size = sb.st_size;
-    g_sinject_context.target_mem = mmap(NULL, g_sinject_context.target_size,
-                                        PROT_READ | PROT_WRITE,
-                                        MAP_FILE | MAP_SHARED,
-                                        g_sinject_context.target_fd, 0);
+    fstat(*fd, &sb);
+    *file_size = sb.st_size;
+    *mapped_mem = mmap(NULL, *file_size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_FILE | MAP_SHARED,
+                       *fd, 0);
     if (g_sinject_context.target_mem == MAP_FAILED) {
         printf("map error fd %d size %lu\n", g_sinject_context.target_fd,
                g_sinject_context.target_size);
@@ -166,49 +200,136 @@ static int cb_action_select_target_elf(int argc, char **argv)
     return 0;
 }
 
-static int cb_action_select_inject_payload(int argc, char **argv)
+static int extend_mapped_file(int fd, size_t *old_size, size_t increment,
+                              void **mapped_mem)
 {
-    struct stat sb;
+    int ret;
+    size_t new_size = *old_size + increment;
 
-    g_sinject_context.payload_fd = open(argv[1], O_RDWR, 0);
-    if (g_sinject_context.payload_fd < 0) {
-        printf("error open %s\n", argv[1]);
-        return -1;
-    }
+    munmap(*mapped_mem, *old_size);
 
-    /* Get the file size and map the entire file in memory*/
-
-    fstat(g_sinject_context.payload_fd, &sb);
-    g_sinject_context.payload_size = sb.st_size;
-    g_sinject_context.payload_mem = mmap(NULL, g_sinject_context.payload_size,
-                                        PROT_READ | PROT_WRITE,
-                                        MAP_FILE | MAP_SHARED,
-                                        g_sinject_context.payload_fd, 0);
-    if (g_sinject_context.payload_mem == MAP_FAILED) {
-        printf("map error fd %d size %lu\n", g_sinject_context.payload_fd,
-               g_sinject_context.payload_size);
-        g_sinject_context.payload_mem = NULL;
-        return -1;
-    }
-
-    return 0;
+    ret = ftruncate(fd, new_size);
+    *mapped_mem = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
+                       MAP_FILE | MAP_SHARED, fd, 0);
+    *old_size = new_size;
+    return ret;
 }
 
-static int cb_action_patch_target(int argc, char **argv)
+static int cb_action_select_target_elf(int argc, char **argv)
 {
-    /* Check if we have a target and a payload opened */
+    return open_and_map_file(argv[1], &g_sinject_context.target_fd,
+                             &g_sinject_context.target_size,
+                             &g_sinject_context.target_mem);
+}
 
-    if (!g_sinject_context.payload_mem) {
-        printf("Missing payload - Use 'select_payload' <elf_payload_path>\n");
-        return -1;
-    }
+static int cb_action_select_payload(int argc, char **argv)
+{
+    return open_and_map_file(argv[1], &g_sinject_context.payload_fd,
+                             &g_sinject_context.payload_size,
+                             &g_sinject_context.payload_mem);
+}
+
+static int cb_action_add_segment(int argc, char **argv)
+{
+    elf_hdr_t *target_elf_hdr, *payload_elf_hdr;
+    int segment_indx;
+    Elf32_Phdr *new_phdr32;
+    Elf64_Phdr *new_phdr64;
 
     if (!g_sinject_context.target_mem) {
         printf("Missing target - Use 'select_target' <elf_target_path>\n");
         return -1;
     }
 
-    
+    target_elf_hdr = g_sinject_context.target_mem;
+    if (memcmp(target_elf_hdr->elf64_hdr.e_ident, elf_signature, sizeof(elf_signature)) != 0) {
+        printf("Target not an ELF file\n");
+        return -1;
+    }
+
+    if (target_elf_hdr->elf64_hdr.e_machine == EM_386) {
+
+        /* Extend the file size and map again */
+
+        extend_mapped_file(g_sinject_context.target_fd,
+                           &g_sinject_context.target_size,
+                           0x1000 + sizeof(Elf32_Phdr),
+                           &g_sinject_context.target_mem);
+
+        target_elf_hdr = g_sinject_context.target_mem;
+   
+        /* Move the memory to create room for the new segment. Add it on the
+         * last segment position and increment the segment number. */
+
+        void *src = (target_elf_hdr->elf32_hdr.e_phoff + 
+            (uint8_t *)g_sinject_context.target_mem) +
+            sizeof(Elf32_Phdr) * target_elf_hdr->elf32_hdr.e_phnum;
+
+        memmove(src + sizeof(Elf32_Phdr),
+                src,
+                g_sinject_context.target_size - (src - g_sinject_context.target_mem)); 
+
+        new_phdr32 = (target_elf_hdr->elf32_hdr.e_phoff +
+            (uint8_t *)g_sinject_context.target_mem);
+        new_phdr32 += target_elf_hdr->elf32_hdr.e_phnum;
+        target_elf_hdr->elf32_hdr.e_phnum++;
+
+        /* Update ELF entry point */
+
+        target_elf_hdr->elf32_hdr.e_entry += sizeof(Elf32_Phdr);
+
+        /* Update the section headers offset */
+
+        target_elf_hdr->elf32_hdr.e_shoff += sizeof(Elf32_Phdr);
+
+        /* Update all of the segment addresses */
+
+        Elf32_Phdr *phdr = target_elf_hdr->elf32_hdr.e_phoff +
+            (uint8_t *)g_sinject_context.target_mem;
+            
+        phdr->p_filesz += sizeof(Elf32_Phdr);
+        phdr->p_memsz += sizeof(Elf32_Phdr);
+
+        for (int i = 1; i < target_elf_hdr->elf32_hdr.e_phnum - 1; i++) {
+            (phdr + i)->p_offset += sizeof(Elf32_Phdr);
+        }
+
+        /* Update all of the section headers addresses */
+
+        Elf32_Shdr *shdr = target_elf_hdr->elf32_hdr.e_shoff +
+            (uint8_t *)g_sinject_context.target_mem;
+
+        for (int i = 0; i < target_elf_hdr->elf32_hdr.e_shnum; i++) {
+            //(shdr + i)->sh_addr += sizeof(Elf32_Phdr);
+            (shdr + i)->sh_offset += sizeof(Elf32_Phdr);
+        } 
+
+        new_phdr32->p_type   = PT_LOAD;
+        new_phdr32->p_filesz = 0x1000;
+        new_phdr32->p_offset = g_sinject_context.target_size - 0x1000 - sizeof(Elf32_Phdr);
+        new_phdr32->p_memsz  = 0x1000;
+        new_phdr32->p_vaddr  = 0x80000000;
+        new_phdr32->p_vaddr  = 0x80000000;
+        new_phdr32->p_align  = 0x1000;
+        new_phdr32->p_flags  = PF_X | PF_R | PF_W;
+
+    } else if (target_elf_hdr->elf64_hdr.e_machine == EM_X86_64) {
+        Elf64_Phdr *phdr = (target_elf_hdr->elf64_hdr.e_phoff +
+            (uint8_t *)g_sinject_context.target_mem);
+        for (segment_indx = 0;
+             segment_indx < target_elf_hdr->elf64_hdr.e_phnum;
+             segment_indx++) {
+            printf("Segment type %s (file_off 0x%x filesz 0x%x)"
+                   "(p_vaddr 0x%x p_memsz 0x%x)\n",
+                   get_ptype_name(phdr->p_type),
+                   phdr->p_offset,
+                   phdr->p_filesz,
+                   phdr->p_vaddr,
+                   phdr->p_paddr);
+            phdr++;
+        }
+    }
+
     return 0;
 }
 
