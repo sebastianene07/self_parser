@@ -231,10 +231,9 @@ static int cb_action_select_payload(int argc, char **argv)
 
 static int cb_action_add_segment(int argc, char **argv)
 {
-    elf_hdr_t *target_elf_hdr, *payload_elf_hdr;
+    elf_hdr_t *target_elf_hdr;
     int segment_indx;
     Elf32_Phdr *new_phdr32;
-    Elf64_Phdr *new_phdr64;
 
     if (!g_sinject_context.target_mem) {
         printf("Missing target - Use 'select_target' <elf_target_path>\n");
@@ -249,78 +248,81 @@ static int cb_action_add_segment(int argc, char **argv)
 
     if (target_elf_hdr->elf64_hdr.e_machine == EM_386) {
 
-        /* Extend the file size and map again */
+        size_t old_size = g_sinject_context.target_size;
+
+        /* Extend the file size with a new Program headers + one new segment
+         * + 0x1000 bytes which will be used for the payload and map again */
 
         extend_mapped_file(g_sinject_context.target_fd,
                            &g_sinject_context.target_size,
-                           0x1000 + sizeof(Elf32_Phdr),
+                           0x1000 + sizeof(Elf32_Phdr) * (target_elf_hdr->elf32_hdr.e_phnum + 1),
                            &g_sinject_context.target_mem);
 
         target_elf_hdr = g_sinject_context.target_mem;
-   
-        /* Move the memory to create room for the new segment. Add it on the
-         * last segment position and increment the segment number. */
+  
+        /* Copy the program headers to the end of the executable */
 
-        void *src = (target_elf_hdr->elf32_hdr.e_phoff + 
-            (uint8_t *)g_sinject_context.target_mem) +
-            sizeof(Elf32_Phdr) * target_elf_hdr->elf32_hdr.e_phnum;
+        void *destination = g_sinject_context.target_mem + old_size;
+        void *src = target_elf_hdr->elf32_hdr.e_phoff + g_sinject_context.target_mem;
 
-        memmove(src + sizeof(Elf32_Phdr),
-                src,
-                g_sinject_context.target_size - (src - g_sinject_context.target_mem)); 
+        memcpy(destination, src, sizeof(Elf32_Phdr) * target_elf_hdr->elf32_hdr.e_phnum);
 
-        new_phdr32 = (target_elf_hdr->elf32_hdr.e_phoff +
-            (uint8_t *)g_sinject_context.target_mem);
-        new_phdr32 += target_elf_hdr->elf32_hdr.e_phnum;
-        target_elf_hdr->elf32_hdr.e_phnum++;
+        /* Populate the new segment data */
 
-        /* Update ELF entry point */
+        size_t new_segment_offset = 0;
+        size_t aligned_address = 0;
 
-        target_elf_hdr->elf32_hdr.e_entry += sizeof(Elf32_Phdr);
+        for (int i = 0; i < target_elf_hdr->elf32_hdr.e_phnum; i++) {
+            Elf32_Phdr *iter_phdr = ((Elf32_Phdr *)destination) + i;
 
-        /* Update the section headers offset */
+            if (iter_phdr->p_type == PT_LOAD) {
+                 aligned_address = iter_phdr->p_vaddr + iter_phdr->p_memsz;
+                 aligned_address = aligned_address + (iter_phdr->p_align - aligned_address % iter_phdr->p_align);
 
-        target_elf_hdr->elf32_hdr.e_shoff += sizeof(Elf32_Phdr);
-
-        /* Update all of the segment addresses */
-
-        Elf32_Phdr *phdr = target_elf_hdr->elf32_hdr.e_phoff +
-            (uint8_t *)g_sinject_context.target_mem;
-            
-        phdr->p_filesz += sizeof(Elf32_Phdr);
-        phdr->p_memsz += sizeof(Elf32_Phdr);
-
-        for (int i = 1; i < target_elf_hdr->elf32_hdr.e_phnum - 1; i++) {
-            (phdr + i)->p_offset += sizeof(Elf32_Phdr);
+                 if (aligned_address > new_segment_offset) {
+                    new_segment_offset = aligned_address;
+                 }
+            }
         }
-
-        /* Update all of the section headers addresses */
-
-        Elf32_Shdr *shdr = target_elf_hdr->elf32_hdr.e_shoff +
-            (uint8_t *)g_sinject_context.target_mem;
-
-        for (int i = 0; i < target_elf_hdr->elf32_hdr.e_shnum; i++) {
-            //(shdr + i)->sh_addr += sizeof(Elf32_Phdr);
-            (shdr + i)->sh_offset += sizeof(Elf32_Phdr);
-        } 
-
+   
+        new_phdr32 = (Elf32_Phdr *)(destination + sizeof(Elf32_Phdr) * target_elf_hdr->elf32_hdr.e_phnum);
         new_phdr32->p_type   = PT_LOAD;
         new_phdr32->p_filesz = 0x1000;
-        new_phdr32->p_offset = g_sinject_context.target_size - 0x1000 - sizeof(Elf32_Phdr);
+        new_phdr32->p_offset = new_segment_offset;
         new_phdr32->p_memsz  = 0x1000;
-        new_phdr32->p_vaddr  = 0x80000000;
-        new_phdr32->p_vaddr  = 0x80000000;
+        new_phdr32->p_vaddr  = new_segment_offset;
+        new_phdr32->p_paddr  = new_segment_offset;
         new_phdr32->p_align  = 0x1000;
         new_phdr32->p_flags  = PF_X | PF_R | PF_W;
 
+        /* Update the first segment program header */
+
+        Elf32_Phdr *phdr_segment = (Elf32_Phdr *)destination;
+        phdr_segment->p_offset += new_phdr32->p_vaddr;
+        phdr_segment->p_memsz  = sizeof(Elf32_Phdr) * (target_elf_hdr->elf32_hdr.e_phnum + 1);
+        phdr_segment->p_filesz = phdr_segment->p_memsz;
+        phdr_segment->p_vaddr  += new_phdr32->p_vaddr;
+        phdr_segment->p_paddr  += new_phdr32->p_paddr;
+
+        /* Update the ELF header with the new program header table and the new
+         * program header segment number*/
+
+        target_elf_hdr->elf32_hdr.e_phnum++;
+        target_elf_hdr->elf32_hdr.e_phoff = old_size;
+
+        size_t increment = new_segment_offset + 0x1000 - g_sinject_context.target_size;
+        extend_mapped_file(g_sinject_context.target_fd,
+                           &g_sinject_context.target_size,
+                           increment,
+                           &g_sinject_context.target_mem);
     } else if (target_elf_hdr->elf64_hdr.e_machine == EM_X86_64) {
-        Elf64_Phdr *phdr = (target_elf_hdr->elf64_hdr.e_phoff +
+        Elf64_Phdr *phdr = (Elf64_Phdr *)(target_elf_hdr->elf64_hdr.e_phoff +
             (uint8_t *)g_sinject_context.target_mem);
         for (segment_indx = 0;
              segment_indx < target_elf_hdr->elf64_hdr.e_phnum;
              segment_indx++) {
-            printf("Segment type %s (file_off 0x%x filesz 0x%x)"
-                   "(p_vaddr 0x%x p_memsz 0x%x)\n",
+            printf("Segment type %s (file_off 0x%lx filesz 0x%lx)"
+                   "(p_vaddr 0x%lx p_memsz 0x%lx)\n",
                    get_ptype_name(phdr->p_type),
                    phdr->p_offset,
                    phdr->p_filesz,
