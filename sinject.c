@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "shell.h"
+#include "shellcode_32.h"
 
 #define NUM_CMD_ACTIONS         (4)
 
