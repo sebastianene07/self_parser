@@ -1,21 +1,22 @@
 CC := gcc
 CFLAGS := -Wall -g
-OUT := self_parser sinject target_shellcode shellcode_32
+OUT := self_parser sinject target payload
 
-all: self_parser sinject target_shellcode
-
-target_shellcode: target_shellcode.c
-	$(CC) $^ -m32 -z nodeflib -L /usr/lib/debug/lib/libc6-prof/x86_64-linux-gnu/  $(CFLAGS) -o $@
-
-shellcode_32: shellcode_32.s
-	$(CC) $^ -m32 -nostartfiles -nodefaultlibs $(CFLAGS) -o $@
-	xxd -s0x1000 -i -l0x30 $@ > shellcode_32.h
+all: self_parser sinject payload target
 
 self_parser: self_parser.c
 	$(CC) $^ $(CFLAGS) -o $@
 
-sinject: sinject.c shellcode_32
+target: target.c
 	$(CC) $< $(CFLAGS) -o $@
 
+sinject: sinject.c
+	$(CC) $< $(CFLAGS) -o $@
+
+payload: payload.c
+	$(CC)  -fPIC -nolibc -nostdlib $< -o $@
+
+.PHONY: clean
 clean:
 	rm -f $(OUT)
+

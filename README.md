@@ -1,36 +1,53 @@
 ### ELF manipulation tools ###
 
+Currently support X86/64.
+
 ```self_parser``` - parse a 32bit ELF file and output its contents
 ```sinject```     - inject a payload (from shell.h) in the target executable
                     and redirect entry point execution. First the payload is
                     executed then, the old program flow.
-```target_shellcode``` - the ELF that we want to modify
-```shellcode```   - the built shellcode from assembly
+```target```    - the ELF that we want to modify
+```payload```   - the ELF payload that we want to inject
 
-### Debug the ELF code after injection ###
 
+### Building ###
+
+Assuming `mdm` package is installed on your system build with Make:
 ```
-gdb target_shellcode
-starti
-```
-
-In another window verify where is the program loaded in memory and print out
-the memory mappings:
-
-```
-cat /proc/$(pidof target_shellcode)/maps
-56555000-56556000 r--p 00000000 08:05 16256395                           /home/sebastianene/repos/self_parser/target_shellcode
-56556000-56557000 r-xp 00001000 08:05 16256395                           /home/sebastianene/repos/self_parser/target_shellcode
-56557000-56558000 r--p 00002000 08:05 16256395                           /home/sebastianene/repos/self_parser/target_shellcode
-56558000-5655a000 rw-p 00002000 08:05 16256395                           /home/sebastianene/repos/self_parser/target_shellcode
-f7fcb000-f7fcf000 r--p 00000000 00:00 0                                  [vvar]                    
-...
-
+make -j`ncpus`
 ```
 
-Back in the GDB client window set a breakpoint in:
+### Example output ###
 
 ```
-b *(0x56555000 + new_entry_point)
-c
+seb@fulg:~/repos/self_parser$ ./sinject 
+Press CTRL-C or q to stop, for help press ? or type help
+
+>> select_target target
+[*] Found 64-bit target ELF
+[*] Found max payload size: 3747
+
+>> select_payload payload
+
+>> inject_fini
+[*] Payload .text size 94
+[*] Payload entrypoint 0x102b
+[*] Append at 0x115d
+[*] Old target entrypoint at 0x1050
+[*] New entrypoint at 0x1188
+[*] Patch nop-chain with call at 11b4
+>> q
+
 ```
+
+### Explanation for advanced users ###
+
+`sinject` opens and mmaps the specified payload and the target file. It finds the RE(read+execute) PT_LOAD
+segment in the target and it computes the remaining space to the next page boundary. That will be the max size
+of our payload. It then copies the .text section from the payload at the end of the .fini section from the target,
+it updates the entrypoint in the target to point to the payload first and then it patches the nop-chain from
+the payload to perform a jump to the original entrypoint.
+
+Note: The payload has to have the nop-chain which will be used by sinject to patch a call instruction to the
+original entrypoint from the target.
+

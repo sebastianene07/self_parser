@@ -12,8 +12,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "shellcode_32.h"
-
 #define NUM_CMD_ACTIONS         (4)
 
 #define MAX_NUM_CMD_ARGS        (10)
@@ -142,28 +140,6 @@ static void do_terminate_handler(int not_used)
     g_run_forever = 0;
 }
 
-static const char *get_ptype_name(int ptype)
-{
-    if (ptype == PT_NULL)
-        return "PT_NULL";
-    else if (ptype == PT_LOAD)
-        return "PT_LOAD";
-    else if (ptype == PT_DYNAMIC)
-        return "PT_DYNAMIC";
-    else if (ptype == PT_INTERP)
-        return "PT_INTERP";
-    else if (ptype == PT_NOTE)
-        return "PT_NOTE";
-    else if (ptype == PT_SHLIB)
-        return "PT_SHLIB";
-    else if (ptype == PT_PHDR)
-        return "PT_PHDR";
-    else if (ptype == PT_GNU_STACK)
-        return "PT_GNU_STACK";
-    else
-        return "UNKNOWN";
-}
-
 static int cb_action_help(int argc, char **argv)
 {
     int i;
@@ -212,20 +188,6 @@ static int open_and_map_file(const char *file_name, int *fd, size_t *file_size,
     return 0;
 }
 
-static int extend_mapped_file(int fd, size_t *old_size, size_t increment,
-                              void **mapped_mem)
-{
-    int ret;
-    size_t new_size = *old_size + increment;
-
-    munmap(*mapped_mem, *old_size);
-
-    ret = ftruncate(fd, new_size);
-    *mapped_mem = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-                       MAP_FILE | MAP_SHARED, fd, 0);
-    *old_size = new_size;
-    return ret;
-}
 static int find_re_segment(elf_hdr_t *hdr, void **out)
 {
     if (hdr->elf64_hdr.e_machine == EM_386) {
@@ -315,6 +277,7 @@ static int cb_action_method_fini_append(int argc, char **argv)
     elf_hdr_t *target_elf_hdr, *payload_elf_hdr;
     void *payload_text_segment, **old_entrypoint, *copy_dest, *payload_entrypoint;
     void *target_fini_end = NULL, *old_target_entrypoint, *payload_text_offset;
+    unsigned char *instr_patch_abs;
     int ret;
     size_t payload_size = 0;
 
@@ -340,7 +303,7 @@ static int cb_action_method_fini_append(int argc, char **argv)
     /* Figure out the size of the text payload */
     if (payload_elf_hdr->elf64_hdr.e_machine == EM_386) {
         payload_size = ((Elf32_Phdr *)payload_text_segment)->p_memsz;
-        payload_entrypoint = (void *)payload_elf_hdr->elf32_hdr.e_entry;
+        payload_entrypoint = (void *)(intptr_t)payload_elf_hdr->elf32_hdr.e_entry;
         payload_text_offset = ((Elf32_Phdr *)payload_text_segment)->p_offset + g_sinject_context.payload_ptr;
     } else if (payload_elf_hdr->elf64_hdr.e_machine == EM_X86_64) {
         payload_size = ((Elf64_Phdr *)payload_text_segment)->p_memsz;
@@ -355,7 +318,7 @@ static int cb_action_method_fini_append(int argc, char **argv)
     if (target_elf_hdr->elf64_hdr.e_machine == EM_386) {
         Elf32_Phdr *phdr = g_sinject_context.target_text_segment;
         old_entrypoint = (void **)&target_elf_hdr->elf32_hdr.e_entry;
-        target_fini_end = (void *)(phdr->p_offset + phdr->p_memsz);
+        target_fini_end = (void *)(intptr_t)(phdr->p_offset + phdr->p_memsz);
     } else if (target_elf_hdr->elf64_hdr.e_machine == EM_X86_64) {
         Elf64_Phdr *phdr = g_sinject_context.target_text_segment;
         old_entrypoint = (void **)&target_elf_hdr->elf64_hdr.e_entry;
@@ -371,8 +334,25 @@ static int cb_action_method_fini_append(int argc, char **argv)
     
     memcpy(copy_dest, payload_text_offset, payload_size);
 
-    /* Find a ret instruction (0xc3) on x86-64 after our new entrypoint */
-    
+    /*
+     * Find the nop chain in the payload and patch a call instruction to the original
+     * entry point from the target ELF. We start searching the nop chain from the new
+     * entry point.
+     * */
+    void *entry_point_abs = *old_entrypoint + (unsigned long)g_sinject_context.target_elf_ptr;
+    size_t search_sz = payload_size - (payload_entrypoint - (payload_text_offset - (unsigned long)g_sinject_context.payload_ptr));
+    unsigned char nop_chain[4] = {0x90, 0x90, 0x90, 0x90};
+    instr_patch_abs = memmem(entry_point_abs, search_sz, nop_chain, sizeof(nop_chain));
+    if (!instr_patch_abs) {
+        printf("ERROR: nop-chain not found in payload\n");
+        return -1;
+    }
+
+    size_t instr_patch_rel = (unsigned long)instr_patch_abs - (unsigned long)g_sinject_context.target_elf_ptr;
+    printf("[*] Patch nop-chain with call at %lx", instr_patch_rel);
+    unsigned int addend = (unsigned int)(intptr_t)old_target_entrypoint - instr_patch_rel;
+    *instr_patch_abs++ = 0xe8;  // call
+    memcpy(instr_patch_abs, &addend, sizeof(addend));
 
     return 0;
 }
