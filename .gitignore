@@ -1,2 +1,5 @@
 /self_parser
 /sinject
+/payload
+/target
+*.swp
