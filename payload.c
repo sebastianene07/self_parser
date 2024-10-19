@@ -28,11 +28,19 @@ static int my_write(int fd, const void *buf, size_t size)
     return result;
 }
 
-void _start(void)
+void _runme(void)
 {
         char txt[] = {'h','a','c','k','e','d','\0'};
 
         my_write(1, txt, 7);
+}
+
+void _start(void)
+{
+        __asm__ __volatile__(
+                "push %rax \n\t"
+                "push %rdx");
+        _runme();
 
         /* This is the instruction that we will patch to go to the original entry point */
         END_PADDING

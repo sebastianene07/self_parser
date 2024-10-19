@@ -350,8 +350,17 @@ static int cb_action_method_fini_append(int argc, char **argv)
 
     size_t instr_patch_rel = (unsigned long)instr_patch_abs - (unsigned long)g_sinject_context.target_elf_ptr;
     printf("[*] Patch nop-chain with call at %lx", instr_patch_rel);
-    unsigned int addend = (unsigned int)(intptr_t)old_target_entrypoint - instr_patch_rel;
-    *instr_patch_abs++ = 0xe8;  // call
+    unsigned int addend = (unsigned int)(intptr_t)old_target_entrypoint - instr_patch_rel - 11;
+    *instr_patch_abs++ = 0x5a;  // pop %rdx
+    *instr_patch_abs++ = 0x58;  // pop %rax
+
+    *instr_patch_abs++ = 0x48;  // mov    %rbp,%rsp
+    *instr_patch_abs++ = 0x89;
+    *instr_patch_abs++ = 0xec;
+
+    *instr_patch_abs++ = 0x5d;  // pop %rbp
+
+    *instr_patch_abs++ = 0xe9;  // jmp to original entry point
     memcpy(instr_patch_abs, &addend, sizeof(addend));
 
     return 0;
